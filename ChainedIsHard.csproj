@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>ChainedIsHard</AssemblyName>
+    <RootNamespace>ChainedIsHard</RootNamespace>
+    <Version>1.0.0</Version>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <Platforms>AnyCPU</Platforms>
+    <NoWarn>$(NoWarn);NETSDK1138</NoWarn>
+
+    <!-- Built against the interop assemblies BepInEx generates from the installed game,
+         so signatures can never drift from the build the mod actually runs on.
+         Override with: dotnet build -p:GameDir="path\to\game" -->
+    <GameDir Condition="'$(GameDir)' == ''">I:\SteamLibrary\steamapps\common\Flipping is Hard Demo</GameDir>
+    <InteropDir>$(GameDir)\BepInEx\interop</InteropDir>
+
+    <!-- dotnet build -p:Deploy=true copies the dll into the game's plugin folder. -->
+    <Deploy Condition="'$(Deploy)' == ''">false</Deploy>
+  </PropertyGroup>
+
+  <Target Name="CheckInterop" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(GameDir)')"
+           Text="GameDir does not exist: '$(GameDir)'. Pass -p:GameDir=&quot;path\to\game&quot;." />
+    <Error Condition="!Exists('$(InteropDir)\Assembly-CSharp.dll')"
+           Text="$(InteropDir)\Assembly-CSharp.dll not found. Install BepInEx 6 IL2CPP into the game and run it once to generate the interop assemblies, or pass -p:GameDir=..." />
+    <!-- The chain is built from FishNet owner ids and published over a FishNet SyncVar, so a
+         half-generated interop missing it would only show up as a MissingMethodException. -->
+    <Error Condition="!Exists('$(InteropDir)\FishNet.Runtime.dll')"
+           Text="$(InteropDir)\FishNet.Runtime.dll not found, the interop is incomplete. Delete $(GameDir)\BepInEx\interop and run the game once." />
+    <Message Importance="high" Text="ChainedIsHard: building against $(InteropDir)" />
+  </Target>
+
+  <ItemGroup>
+    <!-- Pinned rather than the 6.0.0-be.* the other mods use: a floating version makes NuGet
+         hit the BepInEx feed on every restore, and it is often unreachable. This is the same
+         build ChaosIsHard resolved to, and it is already in the local package cache. -->
+    <PackageReference Include="BepInEx.Unity.IL2CPP" Version="6.0.0-be.785" IncludeAssets="compile" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="$(InteropDir)\*.dll" Private="false" />
+  </ItemGroup>
+
+  <Target Name="DeployToGame" AfterTargets="Build" Condition="'$(Deploy)' == 'true'">
+    <MakeDir Directories="$(GameDir)\BepInEx\plugins\ChainedIsHard" />
+    <!-- The game holds the dll open while it runs, and having it open during a build is
+         normal. That should not fail the build for the other installs. -->
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(GameDir)\BepInEx\plugins\ChainedIsHard"
+          ContinueOnError="WarnAndContinue" Retries="2" RetryDelayMilliseconds="300">
+      <Output TaskParameter="CopiedFiles" ItemName="DeployedFile" />
+    </Copy>
+    <Message Importance="high" Condition="'@(DeployedFile)' != ''"
+             Text="ChainedIsHard: deployed to $(GameDir)\BepInEx\plugins\ChainedIsHard" />
+    <Warning Condition="'@(DeployedFile)' == ''"
+             Text="ChainedIsHard: NOT deployed to $(GameDir) - close the game and build again." />
+  </Target>
+
+</Project>
