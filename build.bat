@@ -4,8 +4,9 @@ setlocal
 rem Run from the project folder no matter where the script was invoked from.
 pushd "%~dp0"
 
-rem Main target: the Steam build. Use build-playtest.bat for the playtests on D:.
-set GAME=I:\SteamLibrary\steamapps\common\Flipping is Hard Demo
+rem Main target: the released game, which is what players run. Use build-playtest.bat for
+rem the playtests on D:, or pass -p:GameDir to dotnet build for the demo.
+set GAME=I:\SteamLibrary\steamapps\common\Flipping is Hard
 
 if not exist "%GAME%\BepInEx\interop\Assembly-CSharp.dll" (
     echo No interop found in "%GAME%".

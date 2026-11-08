@@ -1,3 +1,6 @@
+using System;
+using FishNet;
+using FishNet.Managing.Timing;
 using UnityEngine;
 
 namespace ChainedIsHard
@@ -10,72 +13,113 @@ namespace ChainedIsHard
     /// and voice chat has its own delay. A number counting down in the same place on every
     /// screen is the one thing that lets three people move on the same beat.
     ///
-    /// It rides the same SyncVar channel as everything else, with its own tag, and anyone can
-    /// start one. A running count cannot be restarted by a later message from the same start,
-    /// so a message repeated over several publishes - which is how it survives a dropped
-    /// packet - does not keep resetting the clock. The token, not the timestamp, is what makes
-    /// one start distinct from another: clocks on two machines never agree, and this way they
-    /// do not have to.
+    /// Which is why it has to end on the same beat everywhere, not merely start. A count is
+    /// named by the network tick it was called on, and every machine works out from that tick
+    /// how much of it is left: the time the call spent getting here comes off the count instead
+    /// of being added to the end of it. FishNet keeps every client's Tick in step with the
+    /// server's, so the tick is a clock all the machines share - unlike their own clocks, which
+    /// never agree.
+    ///
+    /// The tick also tells one call from the next: a repeat of the count already running, such
+    /// as our own call echoed back to us, is ignored.
     /// </summary>
     internal sealed class Countdown
     {
-        /// <summary>How long a start is republished, so a client that missed one publish still gets it.</summary>
-        private const float RepeatFor = 0.6f;
+        /// <summary>
+        /// Ticks are sent modulo this, so a call fits in the ushort it travels as. Half of it is
+        /// how late a call may arrive and still be read the right way round - many seconds at
+        /// any tick rate, far beyond what a message spends in transit.
+        /// </summary>
+        public const int Window = 2048;
 
-        private int token;
+        private int call = -1;
         private float endsAt = float.NegativeInfinity;
-        private float publishUntil = float.NegativeInfinity;
 
         /// <summary>Seconds left, or 0 when nothing is counting.</summary>
         public float Remaining => Mathf.Max(0f, endsAt - Time.unscaledTime);
 
         public bool IsRunning => Remaining > 0f;
 
-        /// <summary>True while the start still has to go out on the wire.</summary>
-        public bool NeedsPublishing => Time.unscaledTime < publishUntil;
-
-        /// <summary>The token being published, so the receivers can tell one start from the next.</summary>
-        public int Token => token;
-
-        /// <summary>Seconds the count we are publishing runs for.</summary>
-        public float Length { get; private set; }
-
-        /// <summary>Starts a count here and marks it for publishing to everyone else.</summary>
-        public void Start(float seconds)
+        /// <summary>
+        /// Starts a count here, now. Returns the call to send to everyone else, or -1 when there
+        /// is no network clock to name it by and the count stays on this screen.
+        /// </summary>
+        public int Call(float seconds)
         {
-            // Anything but zero: zero is what an untouched message reads as, and a token that
-            // cannot be told from silence would fire a countdown on every client that joins.
-            token = token % 4095 + 1;
-            Length = seconds;
-            endsAt = Time.unscaledTime + seconds;
-            publishUntil = Time.unscaledTime + RepeatFor;
+            TimeManager clock = Clock();
 
-            ChainedPlugin.Logger.LogInfo($"Countdown started: {seconds:0.#}s.");
+            if (clock == null)
+            {
+                Run(-1, seconds);
+                ChainedPlugin.Logger.LogWarning("Countdown started on this screen only: there is no network clock.");
+                return -1;
+            }
+
+            int now = (int)(clock.Tick % Window);
+            Run(now, seconds);
+
+            ChainedPlugin.Logger.LogInfo($"Countdown called: {seconds:0.#}s.");
+            return now;
         }
 
-        /// <summary>Starts a count somebody else called. Repeats of one already running are ignored.</summary>
-        public void Heard(int remoteToken, float seconds)
+        /// <summary>A count somebody called - possibly us, echoed back. Runs whatever is left of it.</summary>
+        public void Heard(int calledAt, float seconds)
         {
-            if (remoteToken == token && IsRunning)
+            if (calledAt == call && IsRunning)
             {
                 return;
             }
 
-            token = remoteToken;
-            Length = seconds;
-            endsAt = Time.unscaledTime + seconds;
+            TimeManager clock = Clock();
 
-            // Not republished: it is not ours to repeat, and two clients echoing each other
-            // would keep the count alive forever.
-            publishUntil = float.NegativeInfinity;
+            if (clock == null)
+            {
+                return;
+            }
 
-            ChainedPlugin.Logger.LogInfo($"Countdown called by another player: {seconds:0.#}s.");
+            int age = ((int)(clock.Tick % Window) - calledAt + Window) % Window;
+
+            // Our estimate of the server tick can sit a tick or two behind the caller's, which
+            // makes a fresh call look almost a whole window old. Past half the window it is that.
+            if (age > Window / 2)
+            {
+                age -= Window;
+            }
+
+            float left = seconds - (float)(age * clock.TickDelta);
+
+            if (left <= 0f)
+            {
+                return;
+            }
+
+            Run(calledAt, left);
+            ChainedPlugin.Logger.LogInfo($"Countdown called by another player: {left:0.##}s left of {seconds:0.#}s.");
         }
 
         public void Clear()
         {
+            call = -1;
             endsAt = float.NegativeInfinity;
-            publishUntil = float.NegativeInfinity;
+        }
+
+        private void Run(int calledAt, float seconds)
+        {
+            call = calledAt;
+            endsAt = Time.unscaledTime + seconds;
+        }
+
+        private static TimeManager Clock()
+        {
+            try
+            {
+                return InstanceFinder.TimeManager;
+            }
+            catch (Exception ex)
+            {
+                ChainedPlugin.Logger.LogWarning($"Could not read the network clock: {ex.Message}");
+                return null;
+            }
         }
     }
 }

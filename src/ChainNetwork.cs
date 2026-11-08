@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using BepInEx.Configuration;
 using EHS;
 using FishNet.Object.Synchronizing;
+using FishNet.Serializing;
+using HarmonyLib;
 using UnityEngine;
 
 namespace ChainedIsHard
@@ -17,21 +20,30 @@ namespace ChainedIsHard
     /// There is no way to add a channel of our own. FishNet generates a serializer per
     /// broadcast type at compile time, so a type declared in a mod has none, and riding on one
     /// of the game's own broadcasts dies in Il2CppInterop, which cannot build a native thunk for
-    /// a delegate taking a non-blittable struct. What does work is writing into an existing
-    /// SyncVar and polling it: PlayerNetworked.LookDirectionSyncVar, whose only consumer in the
-    /// game is a debug overlay.
+    /// a delegate taking a non-blittable struct. So both ride on things the game already sends.
     ///
-    /// One Vector3 is three floats, so the settings go one at a time, tagged:
+    /// The settings go in a SyncVar, polled: PlayerNetworked.LookDirectionSyncVar, whose only
+    /// consumer in the game is a debug overlay. Only the server can write a SyncVar, which is
+    /// fine for settings - only the host has any. One Vector3 is three floats, so they go one
+    /// at a time, tagged:
     ///
-    ///   x = ParamTag + hash12      y = value          (host only)
-    ///   x = CountdownTag + token   y = seconds        (anyone)
+    ///   x = ParamTag + hash20      y = value
+    ///
+    /// The countdown cannot go that way. A client would have to ask the server to write it, and
+    /// the only request the game has for that field, RequestUpdateLookDirectionServerRpc, does
+    /// nothing unless a Troll Mode player is in the lobby - which is why a client's countdown
+    /// never reached anyone. It goes through PlayerFeatureVisualRelay instead: the RPC a pad uses
+    /// to have its effect played everywhere takes any ushort from anyone and hands it to every
+    /// machine, the caller included. A feature id is never above 0xFFFE and the game numbers
+    /// them up from 1, so a block at the top of the range is ours; an id the game does not know
+    /// is looked up, not found, and ignored.
     ///
     /// The host sweeps its whole list, one setting per publish, and starts again. That sweep is
     /// what makes this self-healing: a client that joined late, missed a message or had the mod
     /// reloaded is brought in line within one cycle without anyone noticing it went wrong.
     /// State, never events.
     ///
-    /// The tags sit outside the range ChaosIsHard uses (1..4 &lt;&lt; 20), so the two mods ignore
+    /// The tag sits outside the range ChaosIsHard uses (1..4 &lt;&lt; 20), so the two mods ignore
     /// each other's messages rather than acting on them. They do still share the one SyncVar
     /// though: running both at once means each overwrites the other's message, and both sides
     /// sync slowly and unreliably.
@@ -40,10 +52,16 @@ namespace ChainedIsHard
     {
         private const int TagSize = 1 << 20;
         private const int ParamTag = 5 * TagSize;
-        private const int CountdownTag = 6 * TagSize;
 
-        /// <summary>Hashes and tokens are 12 bits, well inside a float32's exact integer range.</summary>
-        private const int PayloadMask = 0xFFF;
+        /// <summary>First feature id that carries a countdown; the next Countdown.Window ids are ours.</summary>
+        private const ushort CountdownBase = 0xF000;
+
+        /// <summary>
+        /// A setting's hash fills everything below its tag: 20 bits. Twelve, which it used to be,
+        /// made two of twenty keys collide. ParamTag plus this is still well inside the range a
+        /// float32 holds exactly.
+        /// </summary>
+        private const int PayloadMask = TagSize - 1;
 
         private const float PublishInterval = 0.1f;
 
@@ -58,6 +76,7 @@ namespace ChainedIsHard
         private static float lastHostHeardAt = float.NegativeInfinity;
         private static int sweepIndex;
         private static bool writeChecked;
+        private static bool countdownHooked;
 
         /// <summary>Set once by ChainedBehaviour, which owns it.</summary>
         public static Countdown Countdown { get; set; }
@@ -92,6 +111,122 @@ namespace ChainedIsHard
             ChainedPlugin.Logger.LogInfo($"{Synced.Count} settings follow the host.");
         }
 
+        /// <summary>
+        /// Hooks the relay's observer RPC reader, where every machine receives a countdown call.
+        ///
+        /// Not ActivateOneShot(ushort), which looks like the place: the compiler inlined its body
+        /// into the reader, so a received call never goes through it and a patch there never runs.
+        /// The reader has a body of its own (checked in fih-address-map.json) and takes only a
+        /// reader and an enum, so it is safe to patch. The id is the first thing it reads, so a
+        /// prefix can read it first and put the position back.
+        /// </summary>
+        public static void Install(Harmony harmony)
+        {
+            try
+            {
+                MethodInfo target = null;
+
+                foreach (MethodInfo method in AccessTools.GetDeclaredMethods(typeof(PlayerFeatureVisualRelay)))
+                {
+                    if (method.Name.StartsWith("RpcReader___Observers_ActivateOneShotObserverRpc", StringComparison.Ordinal))
+                    {
+                        target = method;
+                        break;
+                    }
+                }
+
+                if (target == null)
+                {
+                    ChainedPlugin.Logger.LogWarning("The relay's one-shot reader is not in this build; " +
+                                                    "countdowns stay on the screen of whoever calls them.");
+                    return;
+                }
+
+                harmony.Patch(target, prefix: new HarmonyMethod(typeof(ChainNetwork), nameof(OnOneShotReceived)));
+                countdownHooked = true;
+            }
+            catch (Exception ex)
+            {
+                ChainedPlugin.Logger.LogWarning($"Could not hook the countdown channel: {ex.Message}");
+            }
+        }
+
+        /// <summary>Sends a countdown call to everyone, us included.</summary>
+        public static void SendCountdown(int calledAt)
+        {
+            if (!countdownHooked)
+            {
+                return;
+            }
+
+            try
+            {
+                PlayerFeatureVisualRelay relay = GameRefs.LocalPlayer?.PlayerFeatureVisualRelay;
+
+                if (relay == null)
+                {
+                    ChainedPlugin.Logger.LogWarning("No relay to send the countdown through; it stays on this screen.");
+                    return;
+                }
+
+                relay.ActivateOneShotServerRpc((ushort)(CountdownBase + calledAt));
+            }
+            catch (Exception ex)
+            {
+                ChainedPlugin.Logger.LogError($"Could not send the countdown: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Peeks at the id a relay one-shot carries before the game reads it. Runs inside the
+        /// game's RPC handling, so nothing may escape it and the reader must be left exactly
+        /// where it was.
+        /// </summary>
+        private static void OnOneShotReceived(PlayerFeatureVisualRelay __instance, PooledReader __0)
+        {
+            ushort id;
+
+            try
+            {
+                int position = __0.Position;
+
+                try
+                {
+                    id = __0.ReadUInt16();
+                }
+                finally
+                {
+                    __0.Position = position;
+                }
+            }
+            catch (Exception ex)
+            {
+                ChainedPlugin.Logger.LogError($"Could not read a relayed one-shot: {ex.Message}");
+                return;
+            }
+
+            if (id < CountdownBase || id >= CountdownBase + Countdown.Window)
+            {
+                return;
+            }
+
+            try
+            {
+                // Our own call coming back: it has been running here since the key went down.
+                if (__instance.IsOwner)
+                {
+                    return;
+                }
+
+                ChainedSettings settings = ChainedPlugin.Settings;
+                Countdown?.Heard(id - CountdownBase, settings.Value(settings.CountdownSeconds));
+            }
+            catch (Exception ex)
+            {
+                ChainedPlugin.Logger.LogError($"Could not read a countdown call: {ex.Message}");
+            }
+        }
+
         public static void Tick(ChainedSettings settings)
         {
             bool host = NetRole.IsHost;
@@ -103,19 +238,21 @@ namespace ChainedIsHard
             }
 
             // Read every frame rather than on a timer: the host cycles through a long list and a
-            // client sampling on its own schedule would miss most of it. The countdown rides the
-            // same channel and is read by host and client alike.
-            Consume(host);
+            // client sampling on its own schedule would miss most of it.
+            if (!host)
+            {
+                Consume();
+            }
 
             if (!host && Remote.Count > 0 && Time.unscaledTime - lastHostHeardAt > HostTimeout)
             {
                 Remote.Clear();
             }
 
-            if (Time.unscaledTime >= nextPublishAt)
+            if (host && Time.unscaledTime >= nextPublishAt)
             {
                 nextPublishAt = Time.unscaledTime + PublishInterval;
-                Publish(settings, host);
+                Publish(settings);
             }
         }
 
@@ -133,7 +270,7 @@ namespace ChainedIsHard
             Remote.Clear();
         }
 
-        private static void Publish(ChainedSettings settings, bool host)
+        private static void Publish(ChainedSettings settings)
         {
             PlayerNetworked networked = GameRefs.LocalPlayer?.PlayerNetworked;
 
@@ -142,18 +279,7 @@ namespace ChainedIsHard
                 return;
             }
 
-            Vector3? state = null;
-
-            // A countdown is somebody shouting "now": it goes out ahead of the sweep, which can
-            // wait a tenth of a second.
-            if (Countdown != null && Countdown.NeedsPublishing)
-            {
-                state = new Vector3(CountdownTag + (Countdown.Token & PayloadMask), Countdown.Length, 0f);
-            }
-            else if (host)
-            {
-                state = NextParam(settings);
-            }
+            Vector3? state = NextParam(settings);
 
             if (state == null)
             {
@@ -162,20 +288,8 @@ namespace ChainedIsHard
 
             try
             {
-                if (host)
-                {
-                    networked.LookDirectionSyncVar.Value = state.Value;
-                    VerifyWrite(networked, state.Value);
-                }
-                else
-                {
-                    // A client cannot write the SyncVar: FishNet SyncVars are the server's to
-                    // set, so writing one here would change nothing but this machine's copy.
-                    // The game already has the round trip for it - it is how a client publishes
-                    // its own look direction - and the server writing it is what replicates it
-                    // to everybody. This is the only reason a client's countdown reaches anyone.
-                    networked.RequestUpdateLookDirectionServerRpc(state.Value, null);
-                }
+                networked.LookDirectionSyncVar.Value = state.Value;
+                VerifyWrite(networked, state.Value);
             }
             catch (Exception ex)
             {
@@ -224,13 +338,13 @@ namespace ChainedIsHard
         }
 
         /// <summary>
-        /// Reads everyone's messages.
+        /// Reads the host's settings.
         ///
         /// Every visible player is checked rather than just one: a client has no reliable handle
         /// on which PlayerRef belongs to the host, and only the host ever writes a parameter, so
         /// wherever one comes from, it came from the host.
         /// </summary>
-        private static void Consume(bool host)
+        private static void Consume()
         {
             try
             {
@@ -251,18 +365,8 @@ namespace ChainedIsHard
                     }
 
                     Vector3 candidate = syncVar.Value;
-                    int tag = Tag(candidate);
 
-                    if (tag == CountdownTag)
-                    {
-                        int token = Mathf.RoundToInt(candidate.x) - CountdownTag;
-
-                        if (candidate.y > 0f && candidate.y <= 60f)
-                        {
-                            Countdown?.Heard(token, candidate.y);
-                        }
-                    }
-                    else if (tag == ParamTag && !host && IsSaneValue(candidate.y))
+                    if (IsParam(candidate) && IsSaneValue(candidate.y))
                     {
                         Remote[Mathf.RoundToInt(candidate.x) - ParamTag] = candidate.y;
                         lastHostHeardAt = Time.unscaledTime;
@@ -271,33 +375,25 @@ namespace ChainedIsHard
             }
             catch (Exception ex)
             {
-                ChainedPlugin.Logger.LogError($"Could not read the lobby's messages: {ex.Message}");
+                ChainedPlugin.Logger.LogError($"Could not read the host's settings: {ex.Message}");
             }
         }
 
-        /// <summary>Which kind of message this is, or 0 when it is not one of ours.</summary>
-        private static int Tag(Vector3 candidate)
+        /// <summary>Whether this is one of the host's settings rather than a look direction or another mod's message.</summary>
+        private static bool IsParam(Vector3 candidate)
         {
-            if (candidate.x < ParamTag || candidate.x >= CountdownTag + TagSize)
-            {
-                return 0;
-            }
-
-            int tag = Mathf.FloorToInt(candidate.x / TagSize) * TagSize;
-            float payload = candidate.x - tag;
-
             // An untouched SyncVar is zero and a real look direction is a unit vector, so
-            // neither can reach a tag. A payload has to be a whole number in range.
-            return payload >= 0f && payload <= PayloadMask && Mathf.Approximately(payload, Mathf.Round(payload))
-                ? tag
-                : 0;
+            // neither can reach the tag. The payload has to be a whole number in range.
+            float payload = candidate.x - ParamTag;
+
+            return payload >= 0f && payload <= PayloadMask && Mathf.Approximately(payload, Mathf.Round(payload));
         }
 
         private static bool IsSaneValue(float value) =>
             !float.IsNaN(value) && !float.IsInfinity(value) && Mathf.Abs(value) < 1e6f;
 
         /// <summary>
-        /// A 12 bit hash of a setting's key.
+        /// A 20 bit hash of a setting's key.
         ///
         /// The key rather than its position in the list, so a build with one setting more or one
         /// fewer than the other side still agrees about the ones they share, instead of shifting

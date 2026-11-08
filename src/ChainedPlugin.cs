@@ -3,13 +3,14 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using BepInEx.Unity.IL2CPP;
+using HarmonyLib;
 using Il2CppInterop.Runtime.Injection;
 using UnityEngine;
 using Object = UnityEngine.Object;
 
 namespace ChainedIsHard
 {
-    [BepInPlugin(Guid, "Chained Is Hard", "1.0.0")]
+    [BepInPlugin(Guid, "Chained Is Hard", "1.1.0")]
     public class ChainedPlugin : BasePlugin
     {
         public const string Guid = "com.dani.chainedishard";
@@ -37,6 +38,12 @@ namespace ChainedIsHard
             // Has to come before anything can read a setting: it builds the list the host
             // publishes and the clients follow.
             ChainNetwork.Start(Settings);
+
+            // Before anything can cross a pad or call a countdown: the patches are how a
+            // neighbour's launch and anyone's countdown reach us.
+            var harmony = new Harmony(Guid);
+            LaunchEvents.Install(harmony);
+            ChainNetwork.Install(harmony);
 
             ClassInjector.RegisterTypeInIl2Cpp<ChainedBehaviour>();
 

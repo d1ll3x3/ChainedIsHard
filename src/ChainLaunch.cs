@@ -10,7 +10,8 @@ using Object = UnityEngine.Object;
 namespace ChainedIsHard
 {
     /// <summary>
-    /// Gets the chain out of the way of boost pads and cannons.
+    /// Gets the chain out of the way of boost pads and cannons, and lets the rest of the chain
+    /// come along for the ride.
     ///
     /// These are the one thing the rope cannot survive. They fire far harder than any
     /// correction is allowed to pull, and no two players cross one at the same instant when
@@ -18,18 +19,18 @@ namespace ChainedIsHard
     /// the worst possible thing: it reads that lag as distance and hauls back whoever it thinks
     /// is ahead, so nobody lands where the level expects.
     ///
-    /// So during a launch there is no rope. Touch a pad, or stand in a cannon while its timer
-    /// runs, and the chain goes slack for a few seconds - long enough for the arc to finish
-    /// before anything starts pulling again. Everyone's machine sees the same pads, the same
-    /// cannons and the same countdown, so everyone suspends at the same time without a word
-    /// being sent.
+    /// So during a launch there is no rope, and with ShareLaunches / ShareCannons whoever was
+    /// left behind gets the same kick from where they stand. The kick is the game's own, step
+    /// for step: a pad sets the velocity and hands out a quarter second of air control, a
+    /// cannon sets the velocity, blocks air control for as long as its data says and marks the
+    /// jump as used. Anything less and the shared arc falls short of the real one.
+    ///
+    /// Pads are heard through LaunchEvents, which reads the game's own messages, so a
+    /// neighbour's crossing reaches us whether or not we saw them touch it. Positions are only
+    /// watched as a fallback, on a build where those hooks would not go in.
     ///
     /// An earlier version teleported you into a cannon a neighbour was waiting in. It is gone:
     /// being dragged into a cannon you did not choose to enter is worse than missing it.
-    ///
-    /// Pads come in two flavours - EHS.SceneBoostPad and the networked one - and this level's
-    /// are the scene kind. Both answer FindShootDirection() and carry a boostForce, so both are
-    /// treated the same.
     /// </summary>
     internal sealed class ChainLaunch
     {
@@ -39,14 +40,21 @@ namespace ChainedIsHard
         /// <summary>Metres of slop around a pad's collider, since a body touches it before its pivot does.</summary>
         private const float PadMargin = 1.2f;
 
-        /// <summary>Seconds before the same pad can throw us again.</summary>
+        /// <summary>Seconds before the same pad can throw us again, and how long our own launch keeps a shared one away.</summary>
         private const float Cooldown = 1.5f;
 
-        /// <summary>What a pad is worth when its force cannot be read.</summary>
-        private const float FallbackForce = 20f;
+        /// <summary>Seconds of air control a pad hands out. Both pad kinds pass 0.25 to ActivateAirControl.</summary>
+        private const float PadAirControl = 0.25f;
 
         /// <summary>Seconds after which a flight that never lands is assumed to be over.</summary>
         private const float MaxFlight = 30f;
+
+        /// <summary>Who was inside a cannon on the last step its timer was running.</summary>
+        private struct Loaded
+        {
+            public bool Us;
+            public bool Others;
+        }
 
         private readonly List<SceneBoostPad> scenePads = new();
         private readonly List<NetworkedInteractableBoostPad> networkedPads = new();
@@ -55,7 +63,7 @@ namespace ChainedIsHard
         private readonly Dictionary<int, float> cooldowns = new();
 
         /// <summary>Cannons counting down with one of us inside, so the shot can be noticed.</summary>
-        private readonly HashSet<int> armed = new();
+        private readonly Dictionary<int, Loaded> armed = new();
 
         private float nextScanAt;
         private int scannedScene;
@@ -63,7 +71,8 @@ namespace ChainedIsHard
         private int lastLoggedPads = -1;
         private int lastLoggedCannons = -1;
         private float suspendedUntil = float.NegativeInfinity;
-        private float lastLaunchAt = float.NegativeInfinity;
+        private float lastSharedAt = float.NegativeInfinity;
+        private float lastSelfLaunchAt = float.NegativeInfinity;
         private float flyingSince = float.NaN;
         private float touchedDownAt = float.NaN;
         private bool airborne;
@@ -74,11 +83,16 @@ namespace ChainedIsHard
         /// <summary>True from the moment a launch throws us until a moment after we hit something.</summary>
         public bool InFlight => !float.IsNaN(flyingSince);
 
-        /// <summary>Seconds left on the cannon we are waiting in, or 0 when there is none.</summary>
+        /// <summary>Seconds left on the cannon one of us is waiting in, or 0 when there is none.</summary>
         public float CannonCountdown { get; private set; }
 
-        /// <summary>True just after a shared pad launch, for the HUD.</summary>
-        public bool JustLaunched => Time.fixedTime - lastLaunchAt < 1f;
+        /// <summary>True just after we took a neighbour's launch, for the HUD.</summary>
+        public bool JustShared => Time.fixedTime - lastSharedAt < 1f;
+
+        /// <summary>What the last shared launch was, for the HUD.</summary>
+        public string LastShared { get; private set; } = string.Empty;
+
+        private bool LaunchedOurselvesRecently => Time.fixedTime - lastSelfLaunchAt < Cooldown;
 
         public void FixedTick(ChainedSettings settings, ChainTopology topology, NeighbourMotion motion)
         {
@@ -86,6 +100,8 @@ namespace ChainedIsHard
 
             if (unsupported || !settings.Value(settings.Enabled) || !topology.Ready)
             {
+                // Whatever went off while there was no chain is not ours to act on later.
+                LaunchEvents.Clear();
                 return;
             }
 
@@ -93,7 +109,13 @@ namespace ChainedIsHard
             {
                 Scan();
                 WatchCannons(settings, topology, motion);
-                WatchPads(settings, topology, motion);
+                TakePadEvents(settings, topology);
+
+                if (!LaunchEvents.PadsHooked)
+                {
+                    WatchPads(settings, topology, motion);
+                }
+
                 WatchFlight(settings);
             }
             catch (Exception ex)
@@ -111,9 +133,11 @@ namespace ChainedIsHard
             cannons.Clear();
             cooldowns.Clear();
             armed.Clear();
+            LaunchEvents.Clear();
             nextScanAt = 0f;
             scannedScene = 0;
             suspendedUntil = float.NegativeInfinity;
+            lastSelfLaunchAt = float.NegativeInfinity;
             EndFlight();
         }
 
@@ -186,10 +210,12 @@ namespace ChainedIsHard
         /// Watches the cannons anyone in the chain is standing in.
         ///
         /// The cannon's timer is a SyncStopwatch, so it is already running on every machine at
-        /// once: whoever pressed the button, everybody sees the same countdown. That makes it
-        /// the right thing to hang the suspension on. It is renewed every step while the timer
-        /// runs, so it also covers the launch itself - the suspension outlives the countdown by
-        /// its full length, which is exactly the window the arc needs.
+        /// once: whoever pressed the button, everybody sees the same countdown, and everybody sees
+        /// it run out on the same step give or take the lag. That makes it the right thing to hang
+        /// both the suspension and the shared shot on.
+        ///
+        /// The shot is the timer running out with one of us still inside, not merely nobody being
+        /// inside any more: climbing back out before it fires is not a launch.
         /// </summary>
         private void WatchCannons(ChainedSettings settings, ChainTopology topology, NeighbourMotion motion)
         {
@@ -204,13 +230,15 @@ namespace ChainedIsHard
                 }
 
                 int id = cannon.GetInstanceID();
-                bool loaded = IsTimerRunning(cannon) && AnyoneInside(topology, motion, collider.bounds);
+                bool running = IsTimerRunning(cannon);
+                bool us = running && IsLocalInside(cannon, collider);
+                bool others = running && AnyoneInside(topology, motion, collider.bounds, skipLocal: true);
 
-                if (loaded)
+                if (us || others)
                 {
                     // Waiting inside it. The rope is off already, so nobody is dragged out of
                     // the barrel while the count runs.
-                    armed.Add(id);
+                    armed[id] = new Loaded { Us = us, Others = others };
                     Suspend(settings);
 
                     float remaining = Remaining(cannon);
@@ -219,23 +247,78 @@ namespace ChainedIsHard
                     {
                         CannonCountdown = remaining;
                     }
+
+                    continue;
                 }
-                else if (armed.Remove(id))
+
+                if (!armed.TryGetValue(id, out Loaded loaded))
                 {
-                    // The count finished with one of us in there: that is the shot.
-                    Launched(settings);
+                    continue;
+                }
+
+                armed.Remove(id);
+
+                if (running)
+                {
+                    // Everyone climbed back out before it went off.
+                    continue;
+                }
+
+                // The count ran out with one of us in there: that is the shot.
+                Launched(settings);
+
+                if (loaded.Us)
+                {
+                    // The game fires us itself.
+                    lastSelfLaunchAt = Time.fixedTime;
+                }
+                else if (settings.Value(settings.ShareCannons) && !LaunchedOurselvesRecently && !OnCooldown(id) &&
+                         InRange(settings, collider.bounds.center))
+                {
+                    ShareCannonShot(cannon, id);
                 }
             }
         }
 
         /// <summary>
-        /// Watches the pads anyone in the chain crosses.
+        /// Acts on every pad anyone has crossed since the last step.
         ///
-        /// Crossing one suspends the rope for everybody who can see it happen, and - when the
-        /// one who crossed it was not us - hands us the same impulse so we fly the same arc from
-        /// where we are standing. The direction comes from the pad's own FindShootDirection()
-        /// because some variants rotate the working component independently of their root, and
-        /// anything derived from that root would be wrong on exactly those.
+        /// Anyone in the chain crossing one slackens the rope for everybody - the one who crossed
+        /// it needs it out of the way as much as the one who did not. And when it was a neighbour
+        /// and not us, we get the same impulse and fly the same arc from where we are standing.
+        /// </summary>
+        private void TakePadEvents(ChainedSettings settings, ChainTopology topology)
+        {
+            while (LaunchEvents.TryTake(out PadUse use))
+            {
+                if (use.OwnerId == topology.LocalOwnerId)
+                {
+                    // Our own crossing, or the lobby echoing it back to us: the game launched us.
+                    lastSelfLaunchAt = Time.fixedTime;
+                    Launched(settings);
+                    continue;
+                }
+
+                if (!topology.Contains(use.OwnerId))
+                {
+                    // Somebody who is not chained to anyone.
+                    continue;
+                }
+
+                Launched(settings);
+
+                if (settings.Value(settings.ShareLaunches) && !LaunchedOurselvesRecently && !OnCooldown(use.PadId) &&
+                    InRange(settings, use.Position))
+                {
+                    SharePadLaunch(use.Direction, use.Force, use.PadId);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The fallback for a build where the pad hooks did not go in: watches the pads anyone in
+        /// the chain is inside of. It misses fast crossings - see LaunchEvents for why - but it is
+        /// better than nothing.
         /// </summary>
         private void WatchPads(ChainedSettings settings, ChainTopology topology, NeighbourMotion motion)
         {
@@ -251,7 +334,7 @@ namespace ChainedIsHard
                 if (pad != null)
                 {
                     Cross(settings, topology, motion, here, pad.gameObject, pad.GetInstanceID(),
-                        () => pad.FindShootDirection(), () => ReadForce(pad));
+                        () => pad.FindShootDirection(), () => LaunchEvents.ReadForce(pad));
                 }
             }
 
@@ -262,7 +345,7 @@ namespace ChainedIsHard
                 if (pad != null)
                 {
                     Cross(settings, topology, motion, here, pad.gameObject, pad.GetInstanceID(),
-                        () => pad.FindShootDirection(), () => ReadForce(pad));
+                        () => pad.FindShootDirection(), () => LaunchEvents.ReadForce(pad));
                 }
             }
         }
@@ -277,7 +360,8 @@ namespace ChainedIsHard
                 return;
             }
 
-            bounds.Expand(PadMargin);
+            // Expand grows the size, so each side gets half of it.
+            bounds.Expand(PadMargin * 2f);
 
             bool weAreOnIt = bounds.Contains(here);
             bool theyAreOnIt = AnyoneInside(topology, motion, bounds, skipLocal: true);
@@ -287,19 +371,93 @@ namespace ChainedIsHard
                 return;
             }
 
-            // Both of us are flying either way: the one who crossed it needs the rope out of the
-            // way as much as the one who did not.
             Launched(settings);
 
             // Standing on it ourselves means the game is about to launch us properly, and doing
             // both would double the kick.
-            if (weAreOnIt || !theyAreOnIt || !settings.Value(settings.ShareLaunches) || OnCooldown(id) ||
-                Vector3.Distance(here, bounds.center) > settings.Value(settings.LaunchRange))
+            if (weAreOnIt || !settings.Value(settings.ShareLaunches) || OnCooldown(id) ||
+                !InRange(settings, bounds.center))
             {
                 return;
             }
 
-            Launch(force(), direction(), id);
+            SharePadLaunch(direction(), force(), id);
+        }
+
+        /// <summary>A pad's kick, exactly as SceneBoostPad.OnPlayerEntered gives it.</summary>
+        private void SharePadLaunch(Vector3 direction, float force, int sourceId)
+        {
+            if (direction.sqrMagnitude < 0.001f || force <= 0f || !Throw(direction.normalized * force, sourceId))
+            {
+                return;
+            }
+
+            try
+            {
+                // Without it the first quarter second of the flight cannot be steered, and the
+                // real pad gives it - which is half of why a shared arc used to fall short.
+                GameRefs.LocalPlayer?.Movement?.ActivateAirControl(PadAirControl);
+            }
+            catch (Exception ex)
+            {
+                ChainedPlugin.Logger.LogWarning($"Could not hand out the pad's air control: {ex.Message}");
+            }
+
+            Shared($"pad, {force:0.#} m/s");
+        }
+
+        /// <summary>A cannon's shot, exactly as its launch routine fires the player inside.</summary>
+        private void ShareCannonShot(NetworkedInteractableCannon cannon, int sourceId)
+        {
+            NetworkDataCannon data = ReadCannonData(cannon);
+
+            if (data == null || data.launchForce <= 0f)
+            {
+                return;
+            }
+
+            // Not normalised: the game multiplies the barrel direction straight by the force.
+            if (!Throw(cannon.FindShootDirection() * data.launchForce, sourceId))
+            {
+                return;
+            }
+
+            try
+            {
+                PlayerRef local = GameRefs.LocalPlayer;
+                local?.Movement?.BlockAirControl(data.blockAirControlDuration);
+                local?.MovementJump?.FakeJump();
+            }
+            catch (Exception ex)
+            {
+                ChainedPlugin.Logger.LogWarning($"Could not apply the rest of the cannon shot: {ex.Message}");
+            }
+
+            Shared($"cannon, {data.launchForce:0.#} m/s");
+        }
+
+        /// <summary>Sets our velocity for a shared launch. False when there is no body to throw.</summary>
+        private bool Throw(Vector3 velocity, int sourceId)
+        {
+            Rigidbody rb = GameRefs.LocalPlayer?.Rb;
+
+            if (rb == null || rb.isKinematic)
+            {
+                return false;
+            }
+
+            rb.linearVelocity = velocity;
+            rb.angularVelocity = Vector3.zero;
+
+            cooldowns[sourceId] = Time.fixedTime + Cooldown;
+            return true;
+        }
+
+        private void Shared(string what)
+        {
+            lastSharedAt = Time.fixedTime;
+            LastShared = what;
+            ChainedPlugin.Logger.LogInfo($"Took a neighbour's launch: {what}.");
         }
 
         /// <summary>
@@ -343,7 +501,7 @@ namespace ChainedIsHard
                 // frame you cross it you are still standing on it, and counting that as a
                 // landing would end the flight before it started.
                 //
-                // If it never lifts us at all - a pad on cooldown, a neighbour standing on one -
+                // If it never lifts us at all - a pad on cooldown, a neighbour out of range -
                 // then there was no launch, and the chain comes straight back.
                 if (Time.fixedTime - flyingSince > settings.Value(settings.LaunchSuspend))
                 {
@@ -418,6 +576,11 @@ namespace ChainedIsHard
             BeginFlight();
         }
 
+        /// <summary>Whether we stand close enough to where it went off for the same arc to mean anything.</summary>
+        private static bool InRange(ChainedSettings settings, Vector3 source) =>
+            ChainTopology.TryGetPosition(GameRefs.LocalPlayer, out Vector3 here) &&
+            Vector3.Distance(here, source) <= settings.Value(settings.LaunchRange);
+
         /// <summary>Whether anyone in the chain is standing in this volume.</summary>
         private static bool AnyoneInside(ChainTopology topology, NeighbourMotion motion, Bounds bounds,
             bool skipLocal = false)
@@ -440,23 +603,22 @@ namespace ChainedIsHard
             return false;
         }
 
-        /// <summary>Gives us the velocity the pad would have given us, exactly as the game computes it.</summary>
-        private void Launch(float force, Vector3 direction, int sourceId)
+        /// <summary>
+        /// Whether the cannon has us loaded. The cannon knows exactly - it is what decides whether
+        /// it fires us - so it is asked first, and our position is only the fallback.
+        /// </summary>
+        private static bool IsLocalInside(NetworkedInteractableCannon cannon, Collider collider)
         {
-            Rigidbody rb = GameRefs.LocalPlayer?.Rb;
-
-            if (rb == null || rb.isKinematic || direction.sqrMagnitude < 0.001f || force <= 0f)
+            try
             {
-                return;
+                return cannon.IsLocalPlayerInsideCannon;
             }
-
-            rb.linearVelocity = direction.normalized * force;
-            rb.angularVelocity = Vector3.zero;
-
-            cooldowns[sourceId] = Time.fixedTime + Cooldown;
-            lastLaunchAt = Time.fixedTime;
-
-            ChainedPlugin.Logger.LogInfo($"Took the same pad launch, {force:0.#} m/s.");
+            catch (Exception ex)
+            {
+                ChainedPlugin.Logger.LogWarning($"Could not ask a cannon whether we are in it: {ex.Message}");
+                return ChainTopology.TryGetPosition(GameRefs.LocalPlayer, out Vector3 here) &&
+                       collider.bounds.Contains(here);
+            }
         }
 
         private static bool IsTimerRunning(NetworkedInteractableBase interactable)
@@ -487,30 +649,18 @@ namespace ChainedIsHard
             }
         }
 
-        private static float ReadForce(SceneBoostPad pad)
+        private static NetworkDataCannon ReadCannonData(NetworkedInteractableCannon cannon)
         {
             try
             {
-                return pad.boostForce > 0f ? pad.boostForce : FallbackForce;
+                return cannon.dataSyncVar != null && cannon.dataSyncVar.Value != null
+                    ? cannon.dataSyncVar.Value
+                    : cannon.dataEditor;
             }
             catch (Exception ex)
             {
-                ChainedPlugin.Logger.LogWarning($"Could not read a pad's force: {ex.Message}");
-                return FallbackForce;
-            }
-        }
-
-        private static float ReadForce(NetworkedInteractableBoostPad pad)
-        {
-            try
-            {
-                NetworkDataBoostPad data = pad.dataSyncVar != null ? pad.dataSyncVar.Value : pad.dataEditor;
-                return data != null && data.boostForce > 0f ? data.boostForce : FallbackForce;
-            }
-            catch (Exception ex)
-            {
-                ChainedPlugin.Logger.LogWarning($"Could not read a pad's force: {ex.Message}");
-                return FallbackForce;
+                ChainedPlugin.Logger.LogWarning($"Could not read a cannon's force: {ex.Message}");
+                return null;
             }
         }
 
@@ -518,7 +668,7 @@ namespace ChainedIsHard
             cooldowns.TryGetValue(instanceId, out float until) && Time.fixedTime < until;
 
         /// <summary>The colliders of an object and its children, as one box.</summary>
-        private static Bounds ColliderBounds(GameObject root)
+        internal static Bounds ColliderBounds(GameObject root)
         {
             var bounds = new Bounds();
             bool any = false;

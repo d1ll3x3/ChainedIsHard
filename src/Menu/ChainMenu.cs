@@ -220,16 +220,17 @@ namespace ChainedIsHard.Menu
             rows.Add(new BoolRow("Chained", settings.Enabled));
             rows.Add(new FloatRow("Chain length (m)", settings.ChainLength, 0.5f, 1f, 200f, "0.#"));
             rows.Add(new FloatRow("Slack before it pulls", settings.Slack, 0.01f, 0f, 0.5f));
-            rows.Add(new FloatRow("Elasticity (0 = rigid)", settings.Elasticity, 0.05f, 0f, 0.98f));
+            rows.Add(new FloatRow("Pull rate (per m of stretch)", settings.PullRate, 0.5f, 0.5f, 30f, "0.#"));
+            rows.Add(new FloatRow("Firmness (1 = cable)", settings.Firmness, 0.05f, 0.05f, 1f));
+            rows.Add(new FloatRow("Strongest pull (m/s²)", settings.MaxPull, 10f, 10f, 1000f, "0"));
+            rows.Add(new FloatRow("Reel-in speed (m/s)", settings.ReelSpeed, 0.5f, 0.5f, 50f, "0.#"));
             rows.Add(new FloatRow("Speed wins the tug", settings.SpeedPull, 0.05f, 0f, 1f));
-            rows.Add(new FloatRow("Share of the pull", settings.Share, 0.05f, 0.05f, 1f));
-            rows.Add(new FloatRow("Braking", settings.Damping, 0.05f, 0f, 1f));
-            rows.Add(new FloatRow("Max pull per step (m)", settings.MaxCorrection, 0.05f, 0.02f, 5f));
 
             rows.Add(new HeaderRow("LAUNCH   (boost pads and cannons)"));
             rows.Add(new FloatRow("Chain slack on a launch (s)", settings.LaunchSuspend, 0.5f, 0f, 20f, "0.#"));
             rows.Add(new FloatRow("Slack after landing (s)", settings.LaunchGrace, 0.1f, 0f, 10f, "0.#"));
             rows.Add(new BoolRow("Share their pad launches", settings.ShareLaunches));
+            rows.Add(new BoolRow("Share their cannon shots", settings.ShareCannons));
             rows.Add(new FloatRow("Launch range (m)", settings.LaunchRange, 1f, 2f, 500f, "0"));
             rows.Add(new FloatRow("Countdown (s)", settings.CountdownSeconds, 1f, 1f, 30f, "0"));
 

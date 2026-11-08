@@ -18,6 +18,7 @@ namespace ChainedIsHard
         private ChainSolver solver;
         private ChainRescue rescue;
         private ChainLaunch launch;
+        private HelpBeams beams;
         private ChainRenderer chainRenderer;
         private Overlay overlay;
         private ChainMenu menu;
@@ -32,6 +33,7 @@ namespace ChainedIsHard
             solver = new ChainSolver();
             rescue = new ChainRescue();
             launch = new ChainLaunch();
+            beams = new HelpBeams();
             chainRenderer = new ChainRenderer();
             overlay = new Overlay();
             menu = new ChainMenu(ChainedPlugin.Settings);
@@ -83,7 +85,12 @@ namespace ChainedIsHard
                     // Anyone can call one, host or not: it is a shout, not a setting.
                     if (InputReader.WasPressedThisFrame(settings.CountdownKey.Value))
                     {
-                        countdown.Start(settings.Value(settings.CountdownSeconds));
+                        int calledAt = countdown.Call(settings.Value(settings.CountdownSeconds));
+
+                        if (calledAt >= 0)
+                        {
+                            ChainNetwork.SendCountdown(calledAt);
+                        }
                     }
                 }
 
@@ -111,8 +118,9 @@ namespace ChainedIsHard
 
                 // Before the rope: a shared launch is meant to replace the pull, not fight it.
                 launch.FixedTick(settings, topology, motion);
+                beams.FixedTick(settings, topology, motion);
 
-                solver.FixedTick(settings, topology, motion, launch);
+                solver.FixedTick(settings, topology, motion, launch, beams);
                 rescue.FixedTick(settings, topology, motion, launch);
             }
             catch (Exception ex)
@@ -130,7 +138,7 @@ namespace ChainedIsHard
                     menu.Draw();
                 }
 
-                overlay.Draw(ChainedPlugin.Settings, topology, solver, rescue, launch, countdown);
+                overlay.Draw(ChainedPlugin.Settings, topology, solver, rescue, launch, beams, countdown);
             }
             catch (Exception ex)
             {

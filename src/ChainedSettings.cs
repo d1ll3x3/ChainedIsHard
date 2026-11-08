@@ -28,13 +28,14 @@ namespace ChainedIsHard
         public ConfigEntry<bool> Enabled { get; }
         public ConfigEntry<float> ChainLength { get; }
         public ConfigEntry<float> Slack { get; }
-        public ConfigEntry<float> Share { get; }
-        public ConfigEntry<float> MaxCorrection { get; }
-        public ConfigEntry<float> Damping { get; }
-        public ConfigEntry<float> Elasticity { get; }
+        public ConfigEntry<float> PullRate { get; }
+        public ConfigEntry<float> Firmness { get; }
+        public ConfigEntry<float> MaxPull { get; }
+        public ConfigEntry<float> ReelSpeed { get; }
         public ConfigEntry<float> SpeedPull { get; }
 
         public ConfigEntry<bool> ShareLaunches { get; }
+        public ConfigEntry<bool> ShareCannons { get; }
         public ConfigEntry<float> LaunchRange { get; }
         public ConfigEntry<float> LaunchSuspend { get; }
         public ConfigEntry<float> LaunchGrace { get; }
@@ -52,6 +53,9 @@ namespace ChainedIsHard
         public ConfigEntry<string> ChainColor { get; }
         public ConfigEntry<bool> ShowStatus { get; }
 
+        /// <summary>Which defaults this file was written with, so a change of default can reach it.</summary>
+        private ConfigEntry<int> ConfigVersion { get; }
+
         public ChainedSettings(ConfigFile configFile)
         {
             file = configFile;
@@ -68,31 +72,31 @@ namespace ChainedIsHard
                 "Whether players are chained at all. Decided by the host.");
             ChainLength = file.Bind("Chain", "ChainLength", 5f,
                 "Metres of chain between two neighbours. Decided by the host.");
-            Slack = file.Bind("Chain", "Slack", 0f,
+            Slack = file.Bind("Chain", "Slack", 0.05f,
                 "Fraction of the length the chain may stretch before it starts pulling. " +
                 "Some slack is what keeps the pull from fighting the network interpolation, " +
                 "which shows up as jitter when two players stand still at full stretch.");
-            Share = file.Bind("Chain", "Share", 1f,
-                "How much of the overshoot this player corrects. Both ends run the same solver, " +
-                "so 0.5 each adds up to the whole. Raise it to be dragged harder than you drag.");
-            MaxCorrection = file.Bind("Chain", "MaxCorrection", 0.6f,
-                "Metres this player may be pulled in a single physics step. The cap is what " +
-                "keeps a lag spike from launching you across the level.");
-            Damping = file.Bind("Chain", "Damping", 0.6f,
-                "How much of the speed you are moving away at is cancelled when the chain goes " +
-                "tight. 1 is a dead stop, 0 is a pull with no braking at all.");
-            Elasticity = file.Bind("Chain", "Elasticity", 0.98f,
-                "How much give the rope has. 0 is the rigid rope: the moment it runs out of " +
-                "length you stop dead. Higher values leave part of the stretch uncorrected each " +
-                "step, so it hauls you back over a few tenths of a second instead of instantly, " +
-                "which is far kinder on cannons and boost pads where the two of you are never " +
-                "quite in the same place. Above about 0.9 it barely pulls at all.");
-            SpeedPull = file.Bind("Chain", "SpeedPull", 1f,
+            PullRate = file.Bind("Chain", "PullRate", 6f,
+                "How fast the rope closes the two of you back in for every metre it is stretched, " +
+                "per second. 6 takes a metre of stretch out at 6 m/s. Higher is a tighter rope, " +
+                "lower lets it stretch further before it hauls you in.");
+            Firmness = file.Bind("Chain", "Firmness", 0.6f,
+                "How much of the speed the rope wants it gets each physics step. 1 gets all of it " +
+                "at once and feels like a steel cable; lower spreads it over a few steps and feels " +
+                "like a rope with some give. It can never overshoot, whatever the value.");
+            MaxPull = file.Bind("Chain", "MaxPull", 120f,
+                "The hardest the rope can ever change your speed, in m/s². The cap is what keeps a " +
+                "lag spike that reads as metres of stretch from launching you across the level.");
+            ReelSpeed = file.Bind("Chain", "ReelSpeed", 4f,
+                "Metres per second the rope is wound back in when it comes back after a launch, a " +
+                "respawn or a pause. It starts as long as the gap between you and shortens to " +
+                "the chain length, instead of snapping back and yanking everyone together.");
+            SpeedPull = file.Bind("Chain", "SpeedPull", 0.5f,
                 "How much speed decides who wins the tug of war. At 0 both ends always give way " +
                 "equally, so a launched player is stopped by a standing one. Higher values let " +
-                "whoever is moving faster drag the slower one instead of being anchored by them, " +
-                "which is what makes a cannon or a boost pad take the whole chain with it. 1 is " +
-                "the strongest it gets.");
+                "whoever is moving faster drag the slower one instead of being anchored by them. " +
+                "1 means the faster player never feels the rope at all, which makes walking away " +
+                "from the group free.");
 
             LaunchSuspend = file.Bind("Launch", "LaunchSuspend", 3f,
                 "Seconds the chain goes slack for after anyone touches a boost pad, and for as " +
@@ -111,6 +115,10 @@ namespace ChainedIsHard
                 "direction and force are read off the pad itself, so you fly the arc it would " +
                 "have given you, from wherever you are standing. Turn it off for the honest " +
                 "version where you both have to hit it.");
+            ShareCannons = file.Bind("Launch", "ShareCannons", true,
+                "Take the same shot as a neighbour fired from a cannon you were not in: its " +
+                "direction and force, from wherever you are standing, as long as you are within " +
+                "LaunchRange of it. Turn it off and everybody has to get in.");
             LaunchRange = file.Bind("Launch", "LaunchRange", 12f,
                 "Metres from the pad past which a shared launch does not apply. A pad's arc only " +
                 "resembles theirs if you set off from roughly where they did, so this wants to " +
@@ -148,13 +156,16 @@ namespace ChainedIsHard
             ShowStatus = file.Bind("Visual", "ShowStatus", true,
                 "Shows the corner readout: network role, who you are chained to and how tight it is.");
 
+            ConfigVersion = file.Bind("Internal", "ConfigVersion", 0,
+                "Which defaults this file was written with. Not a setting; leave it alone.");
+
             // Everything that decides how the chain behaves. Order does not matter - the wire
             // identifies a setting by a hash of its key - but membership does: anything left out
             // of this list is a setting each player would silently have their own version of.
             synced.AddRange(new ConfigEntryBase[]
             {
-                Enabled, ChainLength, Slack, Share, MaxCorrection, Damping, Elasticity, SpeedPull,
-                ShareLaunches, LaunchRange, LaunchSuspend, LaunchGrace, CountdownSeconds,
+                Enabled, ChainLength, Slack, PullRate, Firmness, MaxPull, ReelSpeed, SpeedPull,
+                ShareLaunches, ShareCannons, LaunchRange, LaunchSuspend, LaunchGrace, CountdownSeconds,
                 RescueEnabled, RescueDistance, RescueDelay, RespawnGrace, RescueKeepsSpeed,
             });
         }
@@ -210,15 +221,14 @@ namespace ChainedIsHard
         /// </summary>
         public void Validate()
         {
+            Migrate();
+
             ChainLength.Value = Mathf.Clamp(ChainLength.Value, 1f, 200f);
             Slack.Value = Mathf.Clamp(Slack.Value, 0f, 0.5f);
-            Share.Value = Mathf.Clamp(Share.Value, 0.05f, 1f);
-            MaxCorrection.Value = Mathf.Clamp(MaxCorrection.Value, 0.02f, 5f);
-            Damping.Value = Mathf.Clamp01(Damping.Value);
-
-            // Not quite 1: a fully elastic rope never corrects anything and the chain would
-            // silently stop existing.
-            Elasticity.Value = Mathf.Clamp(Elasticity.Value, 0f, 0.98f);
+            PullRate.Value = Mathf.Clamp(PullRate.Value, 0.5f, 30f);
+            Firmness.Value = Mathf.Clamp(Firmness.Value, 0.05f, 1f);
+            MaxPull.Value = Mathf.Clamp(MaxPull.Value, 10f, 1000f);
+            ReelSpeed.Value = Mathf.Clamp(ReelSpeed.Value, 0.5f, 50f);
             SpeedPull.Value = Mathf.Clamp01(SpeedPull.Value);
 
             LaunchRange.Value = Mathf.Clamp(LaunchRange.Value, 2f, 500f);
@@ -232,6 +242,39 @@ namespace ChainedIsHard
 
             ChainWidth.Value = Mathf.Clamp(ChainWidth.Value, 0.005f, 1f);
             ChainSag.Value = Mathf.Clamp(ChainSag.Value, 0f, 2f);
+        }
+
+        /// <summary>
+        /// Moves a file written with the old rope defaults onto the new ones.
+        ///
+        /// 1.0 shipped with SpeedPull 1 and no slack, from before launches turned the rope off.
+        /// BepInEx never touches a value already in the file, so without this every existing
+        /// install would keep them. Only values still sitting exactly on the old default move -
+        /// anything someone chose stays. Settings that changed meaning got new keys instead, so
+        /// an old number is never read as something it was not.
+        /// </summary>
+        private void Migrate()
+        {
+            const int Current = 2;
+
+            if (ConfigVersion.Value >= Current)
+            {
+                return;
+            }
+
+            ResetIf(SpeedPull, 1f);
+            ResetIf(Slack, 0f);
+
+            ConfigVersion.Value = Current;
+        }
+
+        private static void ResetIf(ConfigEntry<float> entry, float oldDefault)
+        {
+            if (Mathf.Approximately(entry.Value, oldDefault))
+            {
+                entry.Value = (float)entry.DefaultValue;
+                ChainedPlugin.Logger.LogInfo($"{entry.Definition.Key} moved to the new default, {entry.Value:0.##}.");
+            }
         }
 
         public void Save()

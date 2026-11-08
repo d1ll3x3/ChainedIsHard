@@ -48,6 +48,9 @@ namespace ChainedIsHard
         /// <summary>True when there is an actual chain to solve: us plus at least one neighbour.</summary>
         public bool Ready => localOwnerId >= 0 && order.Count >= 2 && order.Contains(localOwnerId);
 
+        /// <summary>Whether this player is part of the chain.</summary>
+        public bool Contains(int ownerId) => order.Contains(ownerId);
+
         /// <summary>The neighbour before us in the chain, or -1 when we are the first link.</summary>
         public int Previous { get; private set; } = -1;
 

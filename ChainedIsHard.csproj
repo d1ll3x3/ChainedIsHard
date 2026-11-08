@@ -5,7 +5,7 @@
     <TargetFramework>net6.0</TargetFramework>
     <AssemblyName>ChainedIsHard</AssemblyName>
     <RootNamespace>ChainedIsHard</RootNamespace>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <Platforms>AnyCPU</Platforms>
@@ -14,7 +14,7 @@
     <!-- Built against the interop assemblies BepInEx generates from the installed game,
          so signatures can never drift from the build the mod actually runs on.
          Override with: dotnet build -p:GameDir="path\to\game" -->
-    <GameDir Condition="'$(GameDir)' == ''">I:\SteamLibrary\steamapps\common\Flipping is Hard Demo</GameDir>
+    <GameDir Condition="'$(GameDir)' == ''">I:\SteamLibrary\steamapps\common\Flipping is Hard</GameDir>
     <InteropDir>$(GameDir)\BepInEx\interop</InteropDir>
 
     <!-- dotnet build -p:Deploy=true copies the dll into the game's plugin folder. -->

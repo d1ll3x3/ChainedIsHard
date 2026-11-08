@@ -31,7 +31,7 @@ namespace ChainedIsHard
         private GUIStyle countdownHintStyle;
 
         public void Draw(ChainedSettings settings, ChainTopology topology, ChainSolver solver, ChainRescue rescue,
-            ChainLaunch launch, Countdown countdown)
+            ChainLaunch launch, HelpBeams beams, Countdown countdown)
         {
             EnsureStyles();
 
@@ -70,12 +70,43 @@ namespace ChainedIsHard
             y += LineHeight * 0.9f;
 
             GUI.Label(new Rect(x, y, Width, LineHeight),
-                $"{solver.LongestLink:0.#}m of {settings.Value(settings.ChainLength):0.#}m" +
-                (launch.Suspended ? "   ·   slack for the launch" : string.Empty) +
-                (rescue.IsAnchor ? "   ·   anchor" : string.Empty), bodyStyle);
+                $"{solver.LongestLink:0.#}m of {settings.Value(settings.ChainLength):0.#}m" + State(topology, solver,
+                    launch, rescue, beams), bodyStyle);
             y += LineHeight * 0.75f;
 
             DrawBar(new Rect(x, y, Width, 4f), solver.Tension);
+        }
+
+        /// <summary>Why the rope is doing what it is doing right now, when it is anything but pulling.</summary>
+        private static string State(ChainTopology topology, ChainSolver solver, ChainLaunch launch, ChainRescue rescue,
+            HelpBeams beams)
+        {
+            if (launch.JustShared)
+            {
+                return $"   ·   took their {launch.LastShared}";
+            }
+
+            if (launch.Suspended)
+            {
+                return "   ·   slack for the launch";
+            }
+
+            if (beams.IsLifted(topology.LocalOwnerId))
+            {
+                return "   ·   lifted, leading";
+            }
+
+            if (beams.IsLifted(topology.Previous) || beams.IsLifted(topology.Next))
+            {
+                return "   ·   following the beam";
+            }
+
+            if (rescue.IsAnchor)
+            {
+                return "   ·   anchor";
+            }
+
+            return solver.Reeling ? "   ·   reeling in" : string.Empty;
         }
 
         /// <summary>
